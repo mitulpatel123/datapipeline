@@ -1,5 +1,7 @@
 requests
 websocket-client
+websockets
+dhanhq
 redis
 sqlalchemy
 psycopg2-binary
