@@ -11,6 +11,7 @@ import pandas as pd
 import requests
 
 from config.settings import BASE_DIR
+from utils.time_utils import today_ist_date
 
 DETAILED_CSV_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 CACHE_PATH = BASE_DIR / "data" / "scrip_master.csv"
@@ -73,8 +74,13 @@ def resolve_nearest_future(
     """Nearest unexpired futures contract security_id for underlying_symbol, or None if
     the cached instrument master has no valid (unexpired) contract -- callers must treat
     None as "skip this metric", not an error, since Dhan's snapshot can lag real listings
-    (verified live: this happened for USDINR)."""
-    today = today or date.today()
+    (verified live: this happened for USDINR).
+
+    Defaults to today_ist_date(), NOT date.today() -- this pipeline runs from a US-based
+    machine against an Indian market, so the local calendar date can already be "tomorrow"
+    or still be "yesterday" relative to IST during market hours. On an expiry/rollover day
+    that mismatch could pick the wrong (already-expired, or one-month-too-far) contract."""
+    today = today or today_ist_date()
     df = load_instrument_master()
     futures = df[
         (df["EXCH_ID"] == exch_id)
