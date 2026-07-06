@@ -26,7 +26,6 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from alerts.telegram_alert import send_telegram_alert
 from analytics.derived_metrics import compute_and_store as compute_derived_analytics
 from config import settings
 from connectors.dhan_account1 import DhanAccount1
@@ -35,8 +34,7 @@ from connectors.dhan_websocket import DhanWebSocketClient
 from connectors.news_connector import fetch_and_store_news
 from connectors.yfinance_connector import fetch_and_store_global_indices
 from storage.gap_watchdog import check_gaps
-from storage.ingest import log_system_error
-from storage.postgres_client import get_session
+from storage.ingest import log_and_alert
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = dtime(9, 0)
@@ -78,12 +76,7 @@ def guarded(job_name: str):
                 return fn(*args, **kwargs)
             except Exception as exc:
                 logger.exception("Job %s failed", job_name)
-                try:
-                    with get_session() as session:
-                        log_system_error(session, job_name, str(exc), severity="error")
-                except Exception:
-                    logger.exception("Failed to log system_error for %s", job_name)
-                send_telegram_alert(f"[data-pipeline] job '{job_name}' raised: {exc}")
+                log_and_alert(job_name, f"job '{job_name}' raised: {exc}")
 
         wrapper.__name__ = fn.__name__
         return wrapper
@@ -213,7 +206,7 @@ def main():
         logger.info("Orchestrator shutting down")
     except Exception as exc:
         logger.exception("Orchestrator crashed")
-        send_telegram_alert(f"[data-pipeline] ORCHESTRATOR CRASHED: {exc}")
+        log_and_alert("orchestrator", f"ORCHESTRATOR CRASHED: {exc}", severity="critical")
         raise
 
 

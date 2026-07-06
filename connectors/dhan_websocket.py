@@ -11,11 +11,10 @@ from zoneinfo import ZoneInfo
 
 from dhanhq import DhanContext, MarketFeed
 
-from alerts.telegram_alert import send_telegram_alert
 from config import settings
 from connectors.instrument_master import HEAVYWEIGHT_STOCKS, NIFTY50_SECURITY_ID, resolve_security_id
 from storage import redis_client
-from storage.ingest import store_tick_rows
+from storage.ingest import log_and_alert, store_tick_rows
 from storage.postgres_client import get_session
 
 logger = logging.getLogger(__name__)
@@ -91,9 +90,9 @@ class DhanWebSocketClient:
         downtime = time.monotonic() - self._down_since
         if downtime > DISCONNECT_ALERT_THRESHOLD_SECONDS and not self._alerted_down:
             self._alerted_down = True
-            send_telegram_alert(
-                f"[data-pipeline] {self.source_account}: websocket down for over "
-                f"{int(downtime)}s. Last error: {error}"
+            log_and_alert(
+                self.source_account,
+                f"{self.source_account}: websocket down for over {int(downtime)}s. Last error: {error}",
             )
 
     def _on_message(self, _instance, data):

@@ -5,6 +5,7 @@ Rejects are logged to system_errors and reported as one batched Telegram alert p
 (never per-row) per spec section 6.2.
 """
 import logging
+from datetime import datetime, timezone
 
 from pydantic import ValidationError
 
@@ -19,13 +20,27 @@ logger = logging.getLogger(__name__)
 def log_system_error(session, component: str, message: str, severity: str = "error"):
     session.add(
         SystemError(
-            fetched_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            fetched_at=datetime.now(timezone.utc),
             component=component,
             error_message=message[:2000],
             severity=severity,
             resolved=False,
         )
     )
+
+
+def log_and_alert(component: str, message: str, severity: str = "error"):
+    """Every Telegram alert should leave an audit trail in system_errors -- the Phase 1j
+    daily report reconstructs "alerts fired" from this table, so any alert path that
+    skips this function is invisible to that report."""
+    from storage.postgres_client import get_session
+
+    try:
+        with get_session() as session:
+            log_system_error(session, component, message, severity=severity)
+    except Exception:
+        logger.exception("Failed to log system_error for alert from %s", component)
+    send_telegram_alert(f"[data-pipeline] {message}")
 
 
 def _report_rejects(component: str, session, rejects: list[str]):

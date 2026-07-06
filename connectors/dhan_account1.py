@@ -12,7 +12,6 @@ from zoneinfo import ZoneInfo
 
 from dhanhq import DhanContext, dhanhq
 
-from alerts.telegram_alert import send_telegram_alert
 from config import settings
 from connectors.instrument_master import (
     HEAVYWEIGHT_STOCKS,
@@ -22,7 +21,7 @@ from connectors.instrument_master import (
 )
 from connectors.rate_limiter import MinIntervalLimiter, TokenBucketRateLimiter
 from storage import redis_client
-from storage.ingest import store_option_chain_snapshot, store_tick_rows
+from storage.ingest import log_and_alert, store_option_chain_snapshot, store_tick_rows
 from storage.postgres_client import get_session
 
 logger = logging.getLogger(__name__)
@@ -83,9 +82,10 @@ class DhanAccount1:
                 delay = min(delay * 2, BACKOFF_CAP_SECONDS)
 
         remarks = last_response.get("remarks") if last_response else "no response"
-        send_telegram_alert(
-            f"[data-pipeline] {self.source_account}: Dhan API call failed after "
-            f"{MAX_RETRIES + 1} attempts. Details: {remarks}"
+        log_and_alert(
+            self.source_account,
+            f"{self.source_account}: Dhan API call failed after {MAX_RETRIES + 1} attempts. "
+            f"Details: {remarks}",
         )
         raise RuntimeError(f"Dhan API call failed on {self.source_account}: {remarks}")
 
