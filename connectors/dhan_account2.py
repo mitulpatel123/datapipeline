@@ -72,11 +72,14 @@ class DhanAccount2:
         self, security_id: str, exchange_segment: str, instrument_type: str,
         from_date: str, to_date: str, expiry_code: int = 0,
     ) -> dict:
+        # Unlike optionchain/expirylist/quote, Dhan's raw historical response body IS the
+        # candle dict directly (no {"data":..., "status":...} wrapper), so the SDK's
+        # response["data"] is already the payload -- no double-nesting here.
         response = self._call(
             self.client.historical_daily_data,
             security_id, exchange_segment, instrument_type, from_date, to_date, expiry_code, True,
         )
-        return response["data"]["data"]
+        return response["data"]
 
     def fetch_intraday(
         self, security_id: str, exchange_segment: str, instrument_type: str,
@@ -86,7 +89,7 @@ class DhanAccount2:
             self.client.intraday_minute_data,
             security_id, exchange_segment, instrument_type, from_date, to_date, interval, True,
         )
-        return response["data"]["data"]
+        return response["data"]
 
     def _store_ohlcv(self, symbol: str, security_id: str, interval: str, candles: dict, fetched_at: datetime):
         timestamps = candles.get("timestamp", [])
