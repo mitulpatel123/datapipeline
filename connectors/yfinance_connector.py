@@ -1,18 +1,23 @@
 """Global indices, commodities, and USD/INR via yfinance.
 
 USD/INR prefers Dhan's nearest-expiry USDINR futures contract (per spec: keep it in
-one system) and falls back to yfinance if that lookup or quote fails for any reason --
-NSE has no standalone USD/INR "spot" instrument, only options and futures contracts,
-so there's a real roll-over dependency there that yfinance's USDINR=X sidesteps entirely.
+one system), but ONLY outside market hours -- during market hours Dhan's REST quota
+is already spent on option chain + quote reconciliation, and this job runs on its
+own 5-minute schedule, so calling Dhan here too would be an uncoordinated collision
+the circuit breaker can't see coming. yfinance USDINR=X is used unconditionally
+during market hours, and as the fallback any time the Dhan path fails (NSE has no
+standalone USD/INR "spot" instrument, only options and futures, so there's a real
+roll-over dependency there that yfinance sidesteps entirely).
 """
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 import yfinance as yf
 
 from storage import redis_client
 from storage.postgres_client import get_session
 from storage.postgres_models import GlobalIndex
+from utils.time_utils import is_market_hours_ist
 
 logger = logging.getLogger(__name__)
 
@@ -32,26 +37,17 @@ USDINR_YFINANCE_TICKER = "USDINR=X"
 
 
 def _fetch_usdinr_via_dhan(dhan_account1) -> tuple[float, float | None] | None:
-    """Best-effort primary path. Returns (value, prev_close) or None to trigger fallback."""
+    """Best-effort primary path, only ever called outside market hours (see module
+    docstring). Returns (value, prev_close) or None to trigger the yfinance fallback."""
     try:
-        from connectors.instrument_master import load_instrument_master
+        from connectors.instrument_master import resolve_nearest_future
 
-        df = load_instrument_master()
-        futures = df[
-            (df["EXCH_ID"] == "NSE")
-            & (df["SEGMENT"] == "C")
-            & (df["UNDERLYING_SYMBOL"] == "USDINR")
-            & (df["INSTRUMENT_TYPE"] == "FUT")
-        ].copy()
-        futures["SM_EXPIRY_DATE"] = futures["SM_EXPIRY_DATE"].astype(str)
-        today = date.today().isoformat()
-        futures = futures[futures["SM_EXPIRY_DATE"] >= today].sort_values("SM_EXPIRY_DATE")
-        if futures.empty:
+        security_id = resolve_nearest_future("USDINR", exch_id="NSE", segment="C")
+        if not security_id:
             return None
-        security_id = int(futures.iloc[0]["SECURITY_ID"])
 
-        response = dhan_account1._call(dhan_account1.client.quote_data, {"NSE_CURRENCY": [security_id]})
-        quote = response["data"]["data"]["NSE_CURRENCY"][str(security_id)]
+        data = dhan_account1.fetch_quote_for("NSE_CURRENCY", [int(security_id)])
+        quote = data["NSE_CURRENCY"][str(security_id)]
         value = quote.get("last_price")
         prev_close = quote.get("ohlc", {}).get("close")
         if not value:
@@ -93,8 +89,11 @@ def fetch_and_store_global_indices(dhan_account1=None) -> int:
             _store_index_row(session, name, float(value), prev_close, fetched_at, "external")
             stored += 1
 
-        usdinr = _fetch_usdinr_via_dhan(dhan_account1) if dhan_account1 else None
-        source = "acct1"
+        usdinr = None
+        source = "external"
+        if dhan_account1 is not None and not is_market_hours_ist():
+            usdinr = _fetch_usdinr_via_dhan(dhan_account1)
+            source = "acct1"
         if usdinr is None:
             usdinr = _fetch_usdinr_via_yfinance()
             source = "external"

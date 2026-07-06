@@ -100,7 +100,7 @@ def option_chain_job():
     if not expiry:
         return
     stored, rejected = acct1.fetch_and_store_option_chain(expiry)
-    compute_derived_analytics(expiry, dhan_account1=acct1)
+    compute_derived_analytics(expiry)
     logger.debug("option_chain_job: stored=%d rejected=%d", stored, rejected)
 
 
@@ -165,7 +165,7 @@ def eod_backfill_job():
     if not acct2:
         logger.warning("Account 2 not configured, skipping EOD backfill")
         return
-    today = date.today().isoformat()
+    today = today_ist_iso()
     acct2.backfill_nifty_daily(today, today)
     acct2.backfill_nifty_intraday(today, today, interval=5)
     for symbol in ("RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"):

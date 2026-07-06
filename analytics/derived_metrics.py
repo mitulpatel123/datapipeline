@@ -2,12 +2,17 @@
 
 Volatility Regime is intentionally omitted -- it depends on India VIX, which is
 blocked pending Section 2 manually-sourced endpoints (see connectors/scraper_vix.py).
-Futures Basis is best-effort: resolves the nearest unexpired NIFTY futures contract
-from the instrument master and quotes it via Dhan, degrading to None (metric skipped,
-not an error) if that lookup fails -- same resilience pattern as USD/INR.
+
+Futures Basis does NOT call Dhan itself. It reads nifty:futures:nearest:latest from
+Redis, populated by the centralized quote call in
+connectors.dhan_account1.DhanAccount1.fetch_market_quote_reconciliation. Calling Dhan
+directly from here would create a second, uncoordinated /marketfeed/quote request on
+every option-chain cycle (every ~3s) that the circuit breaker protecting the account's
+REST calls has no visibility into -- exactly the kind of hidden collision that
+contributed to both accounts getting rate-limited during development.
 """
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from storage import redis_client
 from storage.postgres_client import get_session
@@ -18,6 +23,8 @@ logger = logging.getLogger(__name__)
 VOLUME_ZSCORE_WINDOW = 20
 OI_PREV_TTL_SECONDS = 6 * 3600
 VOL_HIST_TTL_SECONDS = 6 * 3600
+FUTURES_CACHE_STALE_SECONDS = 60
+FUTURES_BASIS_WARN_COOLDOWN_SECONDS = 300
 
 
 def _atm_strike(strikes: list[float], underlying_ltp: float) -> float:
@@ -74,6 +81,9 @@ def compute_moneyness(rows: list[dict], underlying_ltp: float) -> dict:
 
 
 def compute_iv_skew(rows: list[dict], underlying_ltp: float) -> dict:
+    """Nearest OTM call and nearest OTM put BY STRIKE DISTANCE from spot (strikes are
+    sorted ascending, so the first strike above spot / last strike below spot are
+    already the nearest by construction)."""
     strikes = sorted({r["strike"] for r in rows})
     if not strikes:
         return {"otm_put_skew": None, "otm_call_skew": None}
@@ -133,38 +143,72 @@ def compute_volume_zscore(rows: list[dict]) -> dict:
     return zscores
 
 
-def compute_futures_basis(underlying_ltp: float, dhan_account1) -> float | None:
-    if dhan_account1 is None or underlying_ltp is None:
-        return None
-    try:
-        from connectors.instrument_master import load_instrument_master
+def compute_atm_and_oi_summary(rows: list[dict], underlying_ltp: float) -> dict:
+    """Pure math, no Dhan calls -- summary fields useful for Phase 2/3 packets."""
+    strikes = sorted({r["strike"] for r in rows})
+    summary = {
+        "atm_strike": _atm_strike(strikes, underlying_ltp) if strikes and underlying_ltp else None,
+        "highest_call_oi_strike": None,
+        "highest_put_oi_strike": None,
+        "highest_call_volume_strike": None,
+        "highest_put_volume_strike": None,
+        "total_call_oi": sum((r.get("oi") or 0) for r in rows if r["option_type"] == "CE"),
+        "total_put_oi": sum((r.get("oi") or 0) for r in rows if r["option_type"] == "PE"),
+        "total_call_volume": sum((r.get("volume") or 0) for r in rows if r["option_type"] == "CE"),
+        "total_put_volume": sum((r.get("volume") or 0) for r in rows if r["option_type"] == "PE"),
+    }
 
-        df = load_instrument_master()
-        futures = df[
-            (df["EXCH_ID"] == "NSE")
-            & (df["SEGMENT"] == "D")
-            & (df["UNDERLYING_SYMBOL"] == "NIFTY")
-            & (df["INSTRUMENT_TYPE"] == "FUT")
-        ].copy()
-        futures["SM_EXPIRY_DATE"] = futures["SM_EXPIRY_DATE"].astype(str)
-        today = date.today().isoformat()
-        futures = futures[futures["SM_EXPIRY_DATE"] >= today].sort_values("SM_EXPIRY_DATE")
-        if futures.empty:
+    def _argmax_strike(option_type: str, field: str):
+        candidates = [r for r in rows if r["option_type"] == option_type and r.get(field) is not None]
+        if not candidates:
             return None
-        security_id = int(futures.iloc[0]["SECURITY_ID"])
+        return max(candidates, key=lambda r: r[field])["strike"]
 
-        response = dhan_account1._call(dhan_account1.client.quote_data, {"NSE_FNO": [security_id]})
-        quote = response["data"]["data"]["NSE_FNO"][str(security_id)]
-        futures_ltp = quote.get("last_price")
-        if not futures_ltp:
-            return None
-        return float(futures_ltp) - underlying_ltp
-    except Exception:
-        logger.warning("Futures basis computation failed, skipping metric", exc_info=True)
+    summary["highest_call_oi_strike"] = _argmax_strike("CE", "oi")
+    summary["highest_put_oi_strike"] = _argmax_strike("PE", "oi")
+    summary["highest_call_volume_strike"] = _argmax_strike("CE", "volume")
+    summary["highest_put_volume_strike"] = _argmax_strike("PE", "volume")
+    return summary
+
+
+def compute_futures_basis(underlying_ltp: float) -> float | None:
+    if underlying_ltp is None:
         return None
+    cached = redis_client.get_latest("nifty:futures:nearest:latest")
+    if not cached:
+        _warn_once_per_cooldown("No cached futures quote yet -- skipping futures_basis")
+        return None
+    fetched_at = datetime.fromisoformat(cached["fetched_at"])
+    age_seconds = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+    if age_seconds > FUTURES_CACHE_STALE_SECONDS:
+        _warn_once_per_cooldown(f"Cached futures quote is stale ({age_seconds:.0f}s old) -- skipping futures_basis")
+        return None
+    return float(cached["ltp"]) - underlying_ltp
 
 
-def compute_and_store(expiry: str, dhan_account1=None) -> int:
+def _warn_once_per_cooldown(message: str):
+    cooldown_key = "nifty:futures_basis_warn_cooldown"
+    if redis_client.client.set(cooldown_key, "1", ex=FUTURES_BASIS_WARN_COOLDOWN_SECONDS, nx=True):
+        logger.warning(message)
+
+
+def build_market_packet(expiry: str, underlying_ltp, pcr, atm_summary, futures_basis, fetched_at: datetime):
+    """Structured, LLM-free JSON summary for later phases -- no LLM calls happen here,
+    this only prepares clean data."""
+    packet = {
+        "fetched_at": fetched_at.isoformat(),
+        "expiry": expiry,
+        "underlying_ltp": underlying_ltp,
+        "pcr_oi": pcr.get("pcr_oi"),
+        "pcr_volume": pcr.get("pcr_volume"),
+        "futures_basis": futures_basis,
+        **atm_summary,
+    }
+    redis_client.set_latest("nifty:market_packet:latest", packet, ttl=300)
+    return packet
+
+
+def compute_and_store(expiry: str) -> int:
     snapshot = redis_client.get_latest(f"nifty:optionchain:{expiry}:latest")
     if not snapshot:
         logger.warning("No cached option chain snapshot for %s, skipping derived analytics", expiry)
@@ -180,7 +224,8 @@ def compute_and_store(expiry: str, dhan_account1=None) -> int:
     iv_skew = compute_iv_skew(rows, underlying_ltp)
     oi_change = compute_oi_change(expiry, rows)
     vol_z = compute_volume_zscore(rows)
-    futures_basis = compute_futures_basis(underlying_ltp, dhan_account1)
+    futures_basis = compute_futures_basis(underlying_ltp)
+    atm_summary = compute_atm_and_oi_summary(rows, underlying_ltp)
 
     stored = 0
     with get_session() as session:
@@ -207,6 +252,15 @@ def compute_and_store(expiry: str, dhan_account1=None) -> int:
         add("iv_skew_otm_put", iv_skew["otm_put_skew"])
         add("iv_skew_otm_call", iv_skew["otm_call_skew"])
         add("futures_basis", futures_basis)
+        add("atm_strike", atm_summary["atm_strike"])
+        add("highest_call_oi_strike", atm_summary["highest_call_oi_strike"])
+        add("highest_put_oi_strike", atm_summary["highest_put_oi_strike"])
+        add("highest_call_volume_strike", atm_summary["highest_call_volume_strike"])
+        add("highest_put_volume_strike", atm_summary["highest_put_volume_strike"])
+        add("total_call_oi", atm_summary["total_call_oi"])
+        add("total_put_oi", atm_summary["total_put_oi"])
+        add("total_call_volume", atm_summary["total_call_volume"])
+        add("total_put_volume", atm_summary["total_put_volume"])
 
         for (strike, opt_type), change in oi_change.items():
             add("oi_change", change, strike=strike, extra={"option_type": opt_type})
@@ -223,4 +277,5 @@ def compute_and_store(expiry: str, dhan_account1=None) -> int:
 
     if stored:
         redis_client.mark_write("derived_analytics")
+    build_market_packet(expiry, underlying_ltp, pcr, atm_summary, futures_basis, fetched_at)
     return stored

@@ -4,6 +4,7 @@ No auth required -- public CSV. Used at startup by every connector so security I
 looked up from Dhan's own live data instead of being hardcoded/guessed.
 """
 import logging
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -64,6 +65,30 @@ def resolve_security_id(
             f"Ambiguous lookup for {underlying_symbol}: multiple security_ids {security_ids}"
         )
     return security_ids[0]
+
+
+def resolve_nearest_future(
+    underlying_symbol: str, exch_id: str = "NSE", segment: str = "D", today: date | None = None
+) -> str | None:
+    """Nearest unexpired futures contract security_id for underlying_symbol, or None if
+    the cached instrument master has no valid (unexpired) contract -- callers must treat
+    None as "skip this metric", not an error, since Dhan's snapshot can lag real listings
+    (verified live: this happened for USDINR)."""
+    today = today or date.today()
+    df = load_instrument_master()
+    futures = df[
+        (df["EXCH_ID"] == exch_id)
+        & (df["SEGMENT"] == segment)
+        & (df["UNDERLYING_SYMBOL"] == underlying_symbol)
+        & (df["INSTRUMENT_TYPE"] == "FUT")
+    ].copy()
+    if futures.empty:
+        return None
+    futures["SM_EXPIRY_DATE"] = futures["SM_EXPIRY_DATE"].astype(str)
+    futures = futures[futures["SM_EXPIRY_DATE"] >= today.isoformat()].sort_values("SM_EXPIRY_DATE")
+    if futures.empty:
+        return None
+    return str(futures.iloc[0]["SECURITY_ID"])
 
 
 # Verified against the live instrument master CSV -- resolved at import time so any

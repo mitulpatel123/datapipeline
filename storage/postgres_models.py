@@ -6,6 +6,8 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -37,6 +39,7 @@ class OptionChainSnapshot(Base):
     bid: Mapped[float] = mapped_column(Numeric, nullable=True)
     ask: Mapped[float] = mapped_column(Numeric, nullable=True)
     underlying_ltp: Mapped[float] = mapped_column(Numeric, nullable=True)
+    data_quality_flags: Mapped[object] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index("ix_ocs_fetched_at", "fetched_at"),
@@ -65,6 +68,9 @@ class OhlcvIntraday(Base):
     __table_args__ = (
         Index("ix_ohlcv_fetched_at", "fetched_at"),
         Index("ix_ohlcv_symbol_interval_bar", "symbol", "interval", "bar_timestamp"),
+        UniqueConstraint(
+            "source_account", "symbol", "interval", "bar_timestamp", name="uq_ohlcv_bar"
+        ),
     )
 
 
@@ -87,6 +93,7 @@ class TickData(Base):
     __table_args__ = (
         Index("ix_tick_fetched_at", "fetched_at"),
         Index("ix_tick_security_id", "security_id"),
+        Index("ix_tick_account_security_ltt", "source_account", "security_id", "ltt"),
     )
 
 
@@ -160,12 +167,16 @@ class NewsSentiment(Base):
 
     headline: Mapped[str] = mapped_column(String, nullable=False)
     summary: Mapped[str] = mapped_column(String, nullable=True)
-    sentiment: Mapped[str] = mapped_column(String, nullable=True)
+    sentiment: Mapped[str] = mapped_column(String, nullable=True)  # kept for backward compatibility
+    sentiment_score: Mapped[float] = mapped_column(Numeric, nullable=True)
     source: Mapped[str] = mapped_column(String, nullable=True)
     url: Mapped[str] = mapped_column(String, nullable=True)
     published_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (Index("ix_news_fetched_at", "fetched_at"),)
+    __table_args__ = (
+        Index("ix_news_fetched_at", "fetched_at"),
+        Index("uq_news_url", "url", unique=True, postgresql_where=text("url IS NOT NULL")),
+    )
 
 
 class DerivedAnalytics(Base):
@@ -213,8 +224,59 @@ class DataGapLog(Base):
     actual_fetch_time: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=True)
     data_type: Mapped[str] = mapped_column(String, nullable=False)
     gap_seconds: Mapped[float] = mapped_column(Numeric, nullable=True)
+    symbol: Mapped[str] = mapped_column(String, nullable=True)
+    security_id: Mapped[str] = mapped_column(String, nullable=True)
+    severity: Mapped[str] = mapped_column(String, nullable=True)
+    resolved_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_gaplog_fetched_at", "fetched_at"),
         Index("ix_gaplog_data_type", "data_type"),
     )
+
+
+class ApiRequestLog(Base):
+    """Every Dhan REST attempt (including retries) goes through here via
+    connectors.dhan_request_manager -- this is what the daily report uses to compute
+    real request counts and 429 incidents per account/endpoint."""
+
+    __tablename__ = "api_request_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fetched_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_account: Mapped[str] = mapped_column(String, nullable=True)
+
+    endpoint_family: Mapped[str] = mapped_column(String, nullable=False)
+    endpoint_name: Mapped[str] = mapped_column(String, nullable=False)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=True)
+    dhan_status: Mapped[str] = mapped_column(String, nullable=True)
+    remarks: Mapped[str] = mapped_column(String, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=True)
+    rate_limited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    circuit_state: Mapped[str] = mapped_column(String, nullable=True)
+    cooldown_until: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_apilog_fetched_at", "fetched_at"),
+        Index("ix_apilog_account_family_fetched", "source_account", "endpoint_family", "fetched_at"),
+    )
+
+
+class BadPayload(Base):
+    """Quarantine for payloads that fail validation heavily -- lets one malformed
+    response get inspected later without crashing the ingest job or losing the
+    rest of a snapshot."""
+
+    __tablename__ = "bad_payloads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    fetched_at: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_account: Mapped[str] = mapped_column(String, nullable=True)
+
+    component: Mapped[str] = mapped_column(String, nullable=False)
+    reason: Mapped[str] = mapped_column(String, nullable=False)
+    raw_payload: Mapped[str] = mapped_column(String, nullable=True)
+
+    __table_args__ = (Index("ix_badpayload_fetched_at", "fetched_at"),)

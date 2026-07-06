@@ -1,15 +1,17 @@
 """Dhan Account 2: historical / reference connector (lower frequency by design).
 
-If Account 1 gets throttled, this account keeps historical backfill running
-independently -- so it gets its own rate limiter instance, never shared with Account 1.
+Uses its own DhanRequestManager instance (get_request_manager("acct2")) -- never
+shared with Account 1's -- so if Account 1 gets throttled, this account keeps
+historical backfill running independently.
 """
 import logging
-import time
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 from dhanhq import DhanContext, dhanhq
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from config import settings
+from connectors.dhan_request_manager import get_request_manager
 from connectors.instrument_master import (
     HEAVYWEIGHT_STOCKS,
     NIFTY50_EXCHANGE_SEGMENT,
@@ -17,16 +19,11 @@ from connectors.instrument_master import (
     download_instrument_master,
     resolve_security_id,
 )
-from connectors.rate_limiter import TokenBucketRateLimiter
-from storage.ingest import log_and_alert
+from storage import redis_client
 from storage.postgres_client import get_session
 from storage.postgres_models import OhlcvIntraday
-from storage import redis_client
 
 logger = logging.getLogger(__name__)
-
-MAX_RETRIES = 5
-BACKOFF_CAP_SECONDS = 4
 
 
 class DhanAccount2:
@@ -37,32 +34,8 @@ class DhanAccount2:
             raise RuntimeError("DhanAccount2 requires DHAN_CLIENT_ID_2 / DHAN_ACCESS_TOKEN_2 in .env")
         self.context = DhanContext(self.client_id, self.access_token)
         self.client = dhanhq(self.context)
-        self.limiter = TokenBucketRateLimiter(rate_per_second=settings.DHAN_MAX_REQUESTS_PER_SECOND)
         self.source_account = "acct2"
-
-    def _call(self, fn, *args, **kwargs):
-        delay = 1
-        last_response = None
-        for attempt in range(MAX_RETRIES + 1):
-            self.limiter.acquire()
-            last_response = fn(*args, **kwargs)
-            if last_response.get("status") == "success":
-                return last_response
-            logger.warning(
-                "%s Dhan call failed (attempt %d/%d): %s",
-                self.source_account, attempt + 1, MAX_RETRIES + 1, last_response.get("remarks"),
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(delay)
-                delay = min(delay * 2, BACKOFF_CAP_SECONDS)
-
-        remarks = last_response.get("remarks") if last_response else "no response"
-        log_and_alert(
-            self.source_account,
-            f"{self.source_account}: Dhan API call failed after {MAX_RETRIES + 1} attempts. "
-            f"Details: {remarks}",
-        )
-        raise RuntimeError(f"Dhan API call failed on {self.source_account}: {remarks}")
+        self.request_manager = get_request_manager(self.source_account)
 
     def download_and_cache_instrument_master(self):
         path = download_instrument_master()
@@ -76,8 +49,8 @@ class DhanAccount2:
         # Unlike optionchain/expirylist/quote, Dhan's raw historical response body IS the
         # candle dict directly (no {"data":..., "status":...} wrapper), so the SDK's
         # response["data"] is already the payload -- no double-nesting here.
-        response = self._call(
-            self.client.historical_daily_data,
+        response = self.request_manager.call(
+            "historical", "historical_daily_data", self.client.historical_daily_data,
             security_id, exchange_segment, instrument_type, from_date, to_date, expiry_code, True,
         )
         return response["data"]
@@ -86,13 +59,13 @@ class DhanAccount2:
         self, security_id: str, exchange_segment: str, instrument_type: str,
         from_date: str, to_date: str, interval: int = 1,
     ) -> dict:
-        response = self._call(
-            self.client.intraday_minute_data,
+        response = self.request_manager.call(
+            "historical", "intraday_minute_data", self.client.intraday_minute_data,
             security_id, exchange_segment, instrument_type, from_date, to_date, interval, True,
         )
         return response["data"]
 
-    def _store_ohlcv(self, symbol: str, security_id: str, interval: str, candles: dict, fetched_at: datetime):
+    def _store_ohlcv(self, symbol: str, security_id: str, interval: str, candles: dict, fetched_at: datetime) -> int:
         timestamps = candles.get("timestamp", [])
         opens = candles.get("open", [])
         highs = candles.get("high", [])
@@ -101,32 +74,39 @@ class DhanAccount2:
         volumes = candles.get("volume", [])
         ois = candles.get("open_interest", [None] * len(timestamps))
 
-        stored = 0
+        rows = []
+        for i, ts in enumerate(timestamps):
+            bar_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+            rows.append(
+                {
+                    "fetched_at": fetched_at,
+                    "source_account": self.source_account,
+                    "security_id": security_id,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "open": opens[i] if i < len(opens) else None,
+                    "high": highs[i] if i < len(highs) else None,
+                    "low": lows[i] if i < len(lows) else None,
+                    "close": closes[i] if i < len(closes) else None,
+                    "volume": volumes[i] if i < len(volumes) else None,
+                    "oi": ois[i] if i < len(ois) else None,
+                    "bar_timestamp": bar_time,
+                }
+            )
+        if not rows:
+            return 0
+
+        # Postgres unique constraint (source_account, symbol, interval, bar_timestamp) is the
+        # real durability guard here -- Redis dedupe alone expires after 60s, so a rerun of
+        # EOD backfill (or any retry) would otherwise insert duplicate bars.
         with get_session() as session:
-            for i, ts in enumerate(timestamps):
-                bar_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-                dedupe_key = f"ohlcv:{symbol}:{interval}:{bar_time.isoformat()}"
-                if redis_client.is_duplicate(dedupe_key):
-                    continue
-                session.add(
-                    OhlcvIntraday(
-                        fetched_at=fetched_at,
-                        source_account=self.source_account,
-                        security_id=security_id,
-                        symbol=symbol,
-                        interval=interval,
-                        open=opens[i] if i < len(opens) else None,
-                        high=highs[i] if i < len(highs) else None,
-                        low=lows[i] if i < len(lows) else None,
-                        close=closes[i] if i < len(closes) else None,
-                        volume=volumes[i] if i < len(volumes) else None,
-                        oi=ois[i] if i < len(ois) else None,
-                        bar_timestamp=bar_time,
-                    )
-                )
-                stored += 1
+            stmt = pg_insert(OhlcvIntraday).values(rows)
+            stmt = stmt.on_conflict_do_nothing(index_elements=["source_account", "symbol", "interval", "bar_timestamp"])
+            result = session.execute(stmt)
+            stored = result.rowcount or 0
+
         if stored:
-            redis_client.mark_write(f"ohlcv_intraday:{symbol}:{interval}")
+            redis_client.mark_write(f"ohlcv_intraday:{self.source_account}:{symbol}:{interval}")
         return stored
 
     def backfill_nifty_daily(self, from_date: str, to_date: str) -> int:

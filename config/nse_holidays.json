@@ -1,0 +1,4 @@
+{
+  "_comment": "NSE trading holidays, IST dates as YYYY-MM-DD. Fill in from NSE's published holiday calendar. Missing/empty file just falls back to weekend-only skipping.",
+  "holidays": []
+}
