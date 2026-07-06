@@ -1,0 +1,13 @@
+requests
+websocket-client
+redis
+sqlalchemy
+psycopg2-binary
+yfinance
+beautifulsoup4
+lxml
+apscheduler
+python-dotenv
+pandas
+numpy
+pydantic
