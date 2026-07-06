@@ -10,6 +10,7 @@ start()/stop() are idempotent and tracked through an explicit state machine
 misfired scheduler job) can never open a second websocket connection.
 """
 import logging
+import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -32,6 +33,8 @@ PACKET_QUOTE = 17
 PACKET_FULL = 21
 DISCONNECT_ALERT_THRESHOLD_SECONDS = 120
 IST = ZoneInfo("Asia/Kolkata")
+BATCH_FLUSH_INTERVAL_SECONDS = 0.75
+BATCH_FLUSH_MAX_ROWS = 100
 
 
 class _PatchedMarketFeed(MarketFeed):
@@ -72,6 +75,15 @@ class DhanWebSocketClient:
         self._current_atm_strike = None
         self._current_expiry = None
         self._universe_lock = threading.Lock()
+
+        # Batched Postgres writer: opening a new session per tick doesn't scale once the
+        # option universe (up to ~2*OPTION_WS_ATM_STRIKES_EACH_SIDE+1 strikes) is
+        # subscribed alongside NIFTY/futures/stocks. Redis "latest tick" updates stay
+        # immediate (cheap); Postgres writes are batched and flushed on a timer/size
+        # threshold, and drained fully on stop().
+        self._write_queue: queue.Queue = queue.Queue()
+        self._batch_thread: threading.Thread | None = None
+        self._batch_stop = threading.Event()
 
     @property
     def state(self) -> str:
@@ -153,10 +165,43 @@ class DhanWebSocketClient:
             "bid_depth": bid_depth,
             "ask_depth": ask_depth,
         }
-        with get_session() as session:
-            store_tick_rows(session, [row], self.source_account)
         redis_client.set_latest(f"nifty:tick:{sid}:latest", row, ttl=redis_client.TICK_TTL_SECONDS)
-        redis_client.mark_write(f"tick_data:{self.source_account}:{symbol}")
+        self._write_queue.put(row)
+
+    def _flush_batch(self, rows: list[dict]):
+        if not rows:
+            return
+        try:
+            with get_session() as session:
+                store_tick_rows(session, rows, self.source_account)
+        except Exception:
+            logger.exception("Failed to flush websocket tick batch (%d rows)", len(rows))
+
+    def _batch_writer_loop(self):
+        buffer: list[dict] = []
+        last_flush = time.monotonic()
+        while not self._batch_stop.is_set():
+            remaining = BATCH_FLUSH_INTERVAL_SECONDS - (time.monotonic() - last_flush)
+            try:
+                row = self._write_queue.get(timeout=max(0.05, remaining))
+                buffer.append(row)
+            except queue.Empty:
+                pass
+
+            due_by_time = buffer and (time.monotonic() - last_flush) >= BATCH_FLUSH_INTERVAL_SECONDS
+            due_by_size = len(buffer) >= BATCH_FLUSH_MAX_ROWS
+            if due_by_time or due_by_size:
+                self._flush_batch(buffer)
+                buffer = []
+                last_flush = time.monotonic()
+
+        # Drain whatever is left in the queue and flush before the thread exits.
+        while True:
+            try:
+                buffer.append(self._write_queue.get_nowait())
+            except queue.Empty:
+                break
+        self._flush_batch(buffer)
 
     def start(self):
         """Idempotent: returns the existing thread if already starting/running instead
@@ -179,6 +224,11 @@ class DhanWebSocketClient:
                     on_error=self._on_error,
                 )
                 self._thread = self._feed.start()
+
+                self._batch_stop.clear()
+                self._batch_thread = threading.Thread(target=self._batch_writer_loop, daemon=True)
+                self._batch_thread.start()
+
                 self._state = self.State.RUNNING
                 return self._thread
             except Exception:
@@ -196,6 +246,11 @@ class DhanWebSocketClient:
                 if self._feed:
                     self._feed.close_connection()
             finally:
+                self._batch_stop.set()
+                if self._batch_thread:
+                    self._batch_thread.join(timeout=10)
+                self._batch_thread = None
+
                 self._feed = None
                 self._thread = None
                 self._option_instruments = {}

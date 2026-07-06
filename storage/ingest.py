@@ -87,12 +87,13 @@ def store_option_chain_snapshot(session, rows: list[dict], source_account: str) 
 
     _report_rejects("option_chain_snapshot", session, rejects)
     if stored:
-        redis_client.mark_write("option_chain_snapshots")
+        redis_client.mark_write(f"option_chain_snapshots:{source_account}")
     return stored, len(rejects)
 
 
 def store_tick_rows(session, rows: list[dict], source_account: str) -> tuple[int, int]:
     stored, rejects = 0, []
+    stored_symbols: set[str] = set()
     for raw in rows:
         raw = {**raw, "source_account": source_account}
         try:
@@ -117,8 +118,12 @@ def store_tick_rows(session, rows: list[dict], source_account: str) -> tuple[int
             )
         )
         stored += 1
+        stored_symbols.add(validated.symbol)
 
     _report_rejects("tick_data", session, rejects)
-    if stored:
-        redis_client.mark_write("tick_data")
+    # Per-source/instrument marks (e.g. tick_data:acct1_ws:NIFTY) so the gap watchdog can
+    # tell a dead websocket apart from a still-healthy quote-reconciliation feed even
+    # though both write to the same tick_data table.
+    for symbol in stored_symbols:
+        redis_client.mark_write(f"tick_data:{source_account}:{symbol}")
     return stored, len(rejects)

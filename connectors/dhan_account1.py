@@ -133,7 +133,6 @@ class DhanAccount1:
             f"nifty:optionchain:{expiry}:latest",
             {"fetched_at": fetched_at.isoformat(), "underlying_ltp": underlying_ltp, "rows": rows},
         )
-        redis_client.mark_write(f"option_chain_snapshots:{self.source_account}")
         return stored, rejected
 
     def fetch_market_quote_reconciliation(self) -> tuple[int, int]:
