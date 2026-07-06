@@ -1,10 +1,16 @@
-"""Dhan Account 1 live tick feed: NIFTY 50 + 5 heavyweight stocks, Full packet mode.
+"""Dhan Account 1 live tick feed: NIFTY 50, 5 heavyweight stocks, nearest NIFTY
+futures contract, and (when enabled) a live option-chain universe around ATM.
 
 Uses the official dhanhq MarketFeed websocket client. The SDK's own reconnect loop
 (in MarketFeed._run_async) already retries every ~1s when the socket drops, so we
 don't reimplement reconnection -- we only track downtime for alerting purposes.
+
+start()/stop() are idempotent and tracked through an explicit state machine
+(STOPPED/STARTING/RUNNING/STOPPING/ERROR) so a duplicate start() call (e.g. from a
+misfired scheduler job) can never open a second websocket connection.
 """
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -12,7 +18,7 @@ from zoneinfo import ZoneInfo
 from dhanhq import DhanContext, MarketFeed
 
 from config import settings
-from connectors.instrument_master import HEAVYWEIGHT_STOCKS, NIFTY50_SECURITY_ID, resolve_security_id
+from connectors.instrument_master import HEAVYWEIGHT_STOCKS, NIFTY50_SECURITY_ID, resolve_nearest_future, resolve_security_id
 from storage import redis_client
 from storage.ingest import log_and_alert, store_tick_rows
 from storage.postgres_client import get_session
@@ -21,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 EXCHANGE_IDX = 0
 EXCHANGE_NSE_EQ = 1
+EXCHANGE_NSE_FNO = 2
 PACKET_QUOTE = 17
 PACKET_FULL = 21
 DISCONNECT_ALERT_THRESHOLD_SECONDS = 120
@@ -40,6 +47,13 @@ class _PatchedMarketFeed(MarketFeed):
 
 
 class DhanWebSocketClient:
+    class State:
+        STOPPED = "STOPPED"
+        STARTING = "STARTING"
+        RUNNING = "RUNNING"
+        STOPPING = "STOPPING"
+        ERROR = "ERROR"
+
     def __init__(self):
         self.client_id = settings.DHAN_CLIENT_ID_1
         self.access_token = settings.DHAN_ACCESS_TOKEN_1
@@ -50,6 +64,18 @@ class DhanWebSocketClient:
         self._alerted_down = False
         self._feed = None
         self._thread = None
+
+        self._state = self.State.STOPPED
+        self._state_lock = threading.Lock()
+
+        self._option_instruments: dict[str, tuple[int, str, int]] = {}
+        self._current_atm_strike = None
+        self._current_expiry = None
+        self._universe_lock = threading.Lock()
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     @property
     def security_id_to_symbol(self) -> dict:
@@ -70,6 +96,15 @@ class DhanWebSocketClient:
             if sid == NIFTY50_SECURITY_ID:
                 continue
             instruments.append((EXCHANGE_NSE_EQ, sid, PACKET_FULL))
+
+        try:
+            futures_id = resolve_nearest_future("NIFTY", exch_id="NSE", segment="D")
+            if futures_id:
+                instruments.append((EXCHANGE_NSE_FNO, futures_id, PACKET_FULL))
+                self.security_id_to_symbol[futures_id] = "NIFTY_FUT"
+        except Exception:
+            logger.warning("Could not resolve nearest NIFTY futures contract for websocket base universe", exc_info=True)
+
         return instruments
 
     def _on_connect(self, _instance):
@@ -121,22 +156,116 @@ class DhanWebSocketClient:
         with get_session() as session:
             store_tick_rows(session, [row], self.source_account)
         redis_client.set_latest(f"nifty:tick:{sid}:latest", row, ttl=redis_client.TICK_TTL_SECONDS)
+        redis_client.mark_write(f"tick_data:{self.source_account}:{symbol}")
 
     def start(self):
-        """Starts the websocket in a background thread. Returns the thread object."""
-        instruments = self._build_instruments()
-        self._feed = _PatchedMarketFeed(
-            self.context,
-            instruments,
-            version="v2",
-            on_connect=self._on_connect,
-            on_message=self._on_message,
-            on_close=self._on_close,
-            on_error=self._on_error,
-        )
-        self._thread = self._feed.start()
-        return self._thread
+        """Idempotent: returns the existing thread if already starting/running instead
+        of opening a second websocket connection (spec item 9)."""
+        with self._state_lock:
+            if self._state in (self.State.RUNNING, self.State.STARTING):
+                logger.info("Websocket already %s, start() is a no-op", self._state)
+                return self._thread
+
+            self._state = self.State.STARTING
+            try:
+                instruments = self._build_instruments()
+                self._feed = _PatchedMarketFeed(
+                    self.context,
+                    instruments,
+                    version="v2",
+                    on_connect=self._on_connect,
+                    on_message=self._on_message,
+                    on_close=self._on_close,
+                    on_error=self._on_error,
+                )
+                self._thread = self._feed.start()
+                self._state = self.State.RUNNING
+                return self._thread
+            except Exception:
+                self._state = self.State.ERROR
+                raise
 
     def stop(self):
-        if self._feed:
-            self._feed.close_connection()
+        """Idempotent: a no-op if already stopped/stopping."""
+        with self._state_lock:
+            if self._state in (self.State.STOPPED, self.State.STOPPING):
+                logger.info("Websocket already %s, stop() is a no-op", self._state)
+                return
+            self._state = self.State.STOPPING
+            try:
+                if self._feed:
+                    self._feed.close_connection()
+            finally:
+                self._feed = None
+                self._thread = None
+                self._option_instruments = {}
+                self._current_atm_strike = None
+                self._current_expiry = None
+                self._state = self.State.STOPPED
+
+    def refresh_option_universe(self, rows: list[dict], underlying_ltp: float, expiry: str):
+        """Called after each option-chain fetch. Subscribes ATM +/- OPTION_WS_ATM_STRIKES_EACH_SIDE
+        strikes (both CE/PE) for the current expiry, using each leg's security_id from the
+        option chain response. Only resubscribes when the ATM strike has moved by more than
+        1 strike step or the expiry has changed (spec item 10) -- not on every 3s cycle."""
+        if not settings.ENABLE_OPTION_WEBSOCKET_UNIVERSE:
+            return
+        if self._state != self.State.RUNNING or not self._feed:
+            return
+        if not rows or underlying_ltp is None:
+            return
+
+        strikes = sorted({r["strike"] for r in rows})
+        if not strikes:
+            return
+        atm_strike = min(strikes, key=lambda s: abs(s - underlying_ltp))
+        atm_index = strikes.index(atm_strike)
+
+        with self._universe_lock:
+            expiry_changed = expiry != self._current_expiry
+            if self._current_atm_strike is not None and self._current_atm_strike in strikes:
+                prev_index = strikes.index(self._current_atm_strike)
+                atm_shifted = abs(atm_index - prev_index) > 1
+            else:
+                atm_shifted = True
+
+            if not expiry_changed and not atm_shifted:
+                return
+
+            each_side = settings.OPTION_WS_ATM_STRIKES_EACH_SIDE
+            window = set(strikes[max(0, atm_index - each_side): atm_index + each_side + 1])
+
+            new_instruments: dict[str, tuple[int, str, int]] = {}
+            for r in rows:
+                if r["strike"] not in window:
+                    continue
+                sid = r.get("security_id")
+                if not sid:
+                    continue
+                sid = str(sid)
+                new_instruments[sid] = (EXCHANGE_NSE_FNO, sid, PACKET_FULL)
+                self.security_id_to_symbol[sid] = f"{r['strike']}{r['option_type']}"
+
+            old_ids = set(self._option_instruments.keys())
+            new_ids = set(new_instruments.keys())
+
+            to_unsubscribe = [self._option_instruments[sid] for sid in (old_ids - new_ids)]
+            to_subscribe = [new_instruments[sid] for sid in (new_ids - old_ids)]
+
+            try:
+                # SDK batches internally in groups of 100 per JSON subscription message.
+                if to_unsubscribe:
+                    self._feed.unsubscribe_symbols(to_unsubscribe)
+                if to_subscribe:
+                    self._feed.subscribe_symbols(to_subscribe)
+            except Exception:
+                logger.exception("Failed to update option websocket universe")
+                return
+
+            self._option_instruments = new_instruments
+            self._current_atm_strike = atm_strike
+            self._current_expiry = expiry
+            logger.info(
+                "Option websocket universe refreshed: expiry=%s atm=%s strikes_subscribed=%d",
+                expiry, atm_strike, len(new_instruments),
+            )
