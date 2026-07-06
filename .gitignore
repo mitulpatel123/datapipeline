@@ -5,6 +5,8 @@ __pycache__/
 .DS_Store
 logs/*.log
 logs/*.txt
+logs/*.md
+logs/*.json
 *.egg-info/
 .pytest_cache/
 data/*.csv

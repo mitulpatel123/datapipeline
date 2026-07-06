@@ -1,13 +1,17 @@
 """Phase 1j daily validation report: run once/day after market close.
 
-Reports, for a given IST trading day: % expected data points received per source,
-gaps (data_gap_log), validation rejects, alerts fired, and rate-limit incidents per
-account -- all reconstructed from system_errors / data_gap_log, which every
-connector and the orchestrator write to via storage.ingest.log_and_alert /
-log_system_error (see that module's docstring for why this matters).
+Reports real counts (not just expected-vs-errors) for a given IST trading day:
+option chain snapshots (cycles + rows), tick data by source/symbol, quote
+reconciliation cycles, websocket rows by symbol, derived analytics, global
+indices, news, api_request_log request/429 counts per account/endpoint,
+validation rejects, data gaps, and API latency -- then a PASS/WARN/FAIL verdict.
+
+Outputs both a human-readable Markdown report and a machine-readable JSON summary.
 """
 import argparse
+import json
 import sys
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,80 +20,276 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import func, select
 
+from config import settings
 from config.settings import LOG_DIR
+from orchestrator import SCHEDULER_PROFILES
 from storage.postgres_client import get_session
-from storage.postgres_models import DataGapLog, SystemError
+from storage.postgres_models import (
+    ApiRequestLog,
+    DataGapLog,
+    DerivedAnalytics,
+    GlobalIndex,
+    NewsSentiment,
+    OptionChainSnapshot,
+    SystemError,
+    TickData,
+)
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_SECONDS_PER_DAY = int((15 * 3600 + 35 * 60) - (9 * 3600))  # 09:00-15:35 IST
-
-EXPECTED_FETCH_INTERVALS = {
-    "option_chain_snapshots": 3,
-    "tick_data (quote reconciliation)": 5,
-    "global_indices": 300,
-    "news_sentiment": 300,
-}
+WEBSOCKET_HEURISTIC_INTERVAL_SECONDS = 5  # loose floor: at least 1 tick/5s during market hours
+CRITICAL_STREAM_WARN_THRESHOLD = 0.01  # spec: warn if >1% missing cycles
 
 
-def _day_bounds(day: datetime.date) -> tuple[datetime, datetime]:
+def _day_bounds(day) -> tuple[datetime, datetime]:
     start = datetime.combine(day, datetime.min.time(), tzinfo=IST)
     end = start + timedelta(days=1)
     return start, end
 
 
-def generate_report(day) -> str:
+@dataclass
+class ReportData:
+    day: str
+    soak_mode: str
+    option_chain_cycles: int = 0
+    option_chain_rows: int = 0
+    option_chain_expected_cycles: int = 0
+    quote_reconciliation_cycles: int = 0
+    quote_reconciliation_expected_cycles: int = 0
+    ws_nifty_rows: int = 0
+    ws_nifty_expected_rows: int = 0
+    tick_by_source_symbol: dict = field(default_factory=dict)
+    derived_analytics_rows: int = 0
+    derived_analytics_cycles: int = 0
+    global_indices_by_symbol: dict = field(default_factory=dict)
+    news_rows: int = 0
+    api_requests_by_account_family: dict = field(default_factory=dict)
+    api_429_by_account_family: dict = field(default_factory=dict)
+    api_latency_ms_avg: float | None = None
+    api_latency_ms_max: float | None = None
+    validation_rejects: int = 0
+    data_gaps: list = field(default_factory=list)
+    system_error_count: int = 0
+    verdict: str = "PASS"
+    verdict_reasons: list = field(default_factory=list)
+
+
+def _pct_missing(actual: int, expected: int) -> float:
+    if expected <= 0:
+        return 0.0
+    return max(0.0, (expected - actual) / expected)
+
+
+def collect_report_data(day) -> ReportData:
     start, end = _day_bounds(day)
-    lines = [f"=== Daily Validation Report: {day.isoformat()} (IST) ===", ""]
+    profile = SCHEDULER_PROFILES.get(settings.SOAK_MODE, SCHEDULER_PROFILES["safe"])
+    r = ReportData(day=day.isoformat(), soak_mode=settings.SOAK_MODE)
+
+    r.option_chain_expected_cycles = int(MARKET_SECONDS_PER_DAY / profile["option_chain_seconds"])
+    r.quote_reconciliation_expected_cycles = int(MARKET_SECONDS_PER_DAY / profile["quote_reconciliation_seconds"])
+    r.ws_nifty_expected_rows = int(MARKET_SECONDS_PER_DAY / WEBSOCKET_HEURISTIC_INTERVAL_SECONDS)
 
     with get_session() as session:
-        lines.append("-- Expected data points per source --")
-        expected_cycles = MARKET_SECONDS_PER_DAY // 3
-        for label, interval in EXPECTED_FETCH_INTERVALS.items():
-            expected = MARKET_SECONDS_PER_DAY // interval
-            lines.append(f"  {label}: expected ~{expected} fetch cycles (every {interval}s during market hours)")
-        lines.append("")
+        r.option_chain_cycles = session.execute(
+            select(func.count(func.distinct(OptionChainSnapshot.fetched_at))).where(
+                OptionChainSnapshot.fetched_at >= start, OptionChainSnapshot.fetched_at < end
+            )
+        ).scalar() or 0
+        r.option_chain_rows = session.execute(
+            select(func.count()).select_from(OptionChainSnapshot).where(
+                OptionChainSnapshot.fetched_at >= start, OptionChainSnapshot.fetched_at < end
+            )
+        ).scalar() or 0
 
-        lines.append("-- Data gaps (data_gap_log) --")
+        r.quote_reconciliation_cycles = session.execute(
+            select(func.count(func.distinct(TickData.fetched_at))).where(
+                TickData.source_account == "acct1_quote", TickData.fetched_at >= start, TickData.fetched_at < end
+            )
+        ).scalar() or 0
+
+        r.ws_nifty_rows = session.execute(
+            select(func.count()).select_from(TickData).where(
+                TickData.source_account == "acct1_ws", TickData.symbol == "NIFTY",
+                TickData.fetched_at >= start, TickData.fetched_at < end,
+            )
+        ).scalar() or 0
+
+        tick_rows = session.execute(
+            select(TickData.source_account, TickData.symbol, func.count()).where(
+                TickData.fetched_at >= start, TickData.fetched_at < end
+            ).group_by(TickData.source_account, TickData.symbol)
+        ).all()
+        for source_account, symbol, count in tick_rows:
+            r.tick_by_source_symbol[f"{source_account}:{symbol}"] = count
+
+        r.derived_analytics_rows = session.execute(
+            select(func.count()).select_from(DerivedAnalytics).where(
+                DerivedAnalytics.fetched_at >= start, DerivedAnalytics.fetched_at < end
+            )
+        ).scalar() or 0
+        r.derived_analytics_cycles = session.execute(
+            select(func.count(func.distinct(DerivedAnalytics.fetched_at))).where(
+                DerivedAnalytics.fetched_at >= start, DerivedAnalytics.fetched_at < end
+            )
+        ).scalar() or 0
+
+        global_rows = session.execute(
+            select(GlobalIndex.symbol, func.count()).where(
+                GlobalIndex.fetched_at >= start, GlobalIndex.fetched_at < end
+            ).group_by(GlobalIndex.symbol)
+        ).all()
+        for symbol, count in global_rows:
+            r.global_indices_by_symbol[symbol] = count
+
+        r.news_rows = session.execute(
+            select(func.count()).select_from(NewsSentiment).where(
+                NewsSentiment.fetched_at >= start, NewsSentiment.fetched_at < end
+            )
+        ).scalar() or 0
+
+        api_rows = session.execute(
+            select(ApiRequestLog.source_account, ApiRequestLog.endpoint_family, ApiRequestLog.rate_limited).where(
+                ApiRequestLog.fetched_at >= start, ApiRequestLog.fetched_at < end
+            )
+        ).all()
+        for source_account, endpoint_family, rate_limited in api_rows:
+            key = f"{source_account}/{endpoint_family}"
+            r.api_requests_by_account_family[key] = r.api_requests_by_account_family.get(key, 0) + 1
+            if rate_limited:
+                r.api_429_by_account_family[key] = r.api_429_by_account_family.get(key, 0) + 1
+
+        latency_stats = session.execute(
+            select(func.avg(ApiRequestLog.latency_ms), func.max(ApiRequestLog.latency_ms)).where(
+                ApiRequestLog.fetched_at >= start, ApiRequestLog.fetched_at < end
+            )
+        ).one_or_none()
+        if latency_stats and latency_stats[0] is not None:
+            r.api_latency_ms_avg = round(float(latency_stats[0]), 1)
+            r.api_latency_ms_max = int(latency_stats[1]) if latency_stats[1] is not None else None
+
+        r.validation_rejects = session.execute(
+            select(func.count()).select_from(SystemError).where(
+                SystemError.fetched_at >= start, SystemError.fetched_at < end,
+                SystemError.error_message.ilike("%rejected on validation%"),
+            )
+        ).scalar() or 0
+
+        r.system_error_count = session.execute(
+            select(func.count()).select_from(SystemError).where(
+                SystemError.fetched_at >= start, SystemError.fetched_at < end
+            )
+        ).scalar() or 0
+
         gaps = session.execute(
             select(DataGapLog).where(DataGapLog.fetched_at >= start, DataGapLog.fetched_at < end)
         ).scalars().all()
-        if not gaps:
-            lines.append("  none")
-        for gap in gaps:
-            lines.append(f"  {gap.data_type}: gap of {gap.gap_seconds}s at {gap.fetched_at}")
-        lines.append("")
+        r.data_gaps = [
+            {"data_type": g.data_type, "gap_seconds": float(g.gap_seconds) if g.gap_seconds else None, "severity": g.severity}
+            for g in gaps
+        ]
 
-        lines.append("-- Validation rejects --")
-        rejects = session.execute(
-            select(SystemError).where(
-                SystemError.fetched_at >= start,
-                SystemError.fetched_at < end,
-                SystemError.error_message.ilike("%rejected on validation%"),
-            )
-        ).scalars().all()
-        if not rejects:
-            lines.append("  none")
-        for row in rejects:
-            lines.append(f"  [{row.component}] {row.error_message[:200]}")
-        lines.append("")
+    _apply_verdict(r)
+    return r
 
-        lines.append("-- Alerts fired (all system_errors) --")
-        all_errors = session.execute(
-            select(SystemError).where(SystemError.fetched_at >= start, SystemError.fetched_at < end)
-        ).scalars().all()
-        lines.append(f"  total: {len(all_errors)}")
-        for row in all_errors:
-            lines.append(f"  [{row.severity}] [{row.component}] {row.error_message[:200]}")
-        lines.append("")
 
-        lines.append("-- Rate-limit incidents per account --")
-        for account in ("acct1", "acct2"):
-            hits = [
-                row for row in all_errors
-                if row.component == account
-                and any(k in row.error_message.lower() for k in ("429", "too many requests", "rate limit"))
-            ]
-            lines.append(f"  {account}: {len(hits)} incident(s)")
+def _apply_verdict(r: ReportData):
+    reasons = []
+    total_429 = sum(r.api_429_by_account_family.values())
+    if total_429 > 0 and r.soak_mode in ("normal", "production"):
+        reasons.append(f"FAIL: {total_429} Dhan rate-limit (429) incident(s) occurred while running in '{r.soak_mode}' mode")
+
+    oc_missing_pct = _pct_missing(r.option_chain_cycles, r.option_chain_expected_cycles)
+    if oc_missing_pct > CRITICAL_STREAM_WARN_THRESHOLD:
+        reasons.append(f"WARN: option chain cycles missing {oc_missing_pct:.1%} (actual={r.option_chain_cycles}, expected~={r.option_chain_expected_cycles})")
+
+    qr_missing_pct = _pct_missing(r.quote_reconciliation_cycles, r.quote_reconciliation_expected_cycles)
+    if qr_missing_pct > CRITICAL_STREAM_WARN_THRESHOLD:
+        reasons.append(f"WARN: quote reconciliation cycles missing {qr_missing_pct:.1%} (actual={r.quote_reconciliation_cycles}, expected~={r.quote_reconciliation_expected_cycles})")
+
+    ws_missing_pct = _pct_missing(r.ws_nifty_rows, r.ws_nifty_expected_rows)
+    if ws_missing_pct > CRITICAL_STREAM_WARN_THRESHOLD:
+        reasons.append(f"WARN: websocket NIFTY rows missing {ws_missing_pct:.1%} (actual={r.ws_nifty_rows}, expected(heuristic)~={r.ws_nifty_expected_rows})")
+
+    if any(g["severity"] == "critical" for g in r.data_gaps):
+        reasons.append("WARN: at least one critical-severity data gap logged")
+
+    if total_429 > 0 and r.soak_mode == "safe":
+        reasons.append(f"WARN: {total_429} Dhan rate-limit (429) incident(s) occurred (soak mode is 'safe', not yet FAIL-graded)")
+
+    if any(msg.startswith("FAIL") for msg in reasons):
+        r.verdict = "FAIL"
+    elif reasons:
+        r.verdict = "WARN"
+    else:
+        r.verdict = "PASS"
+    r.verdict_reasons = reasons
+
+
+def render_markdown(r: ReportData) -> str:
+    lines = [
+        f"# Daily Validation Report: {r.day} (IST)",
+        "",
+        f"**SOAK_MODE:** {r.soak_mode}",
+        f"**Verdict: {r.verdict}**",
+        "",
+    ]
+    if r.verdict_reasons:
+        lines.append("Reasons:")
+        for reason in r.verdict_reasons:
+            lines.append(f"- {reason}")
+    else:
+        lines.append("No issues found.")
+    lines.append("")
+
+    lines += [
+        "## Option chain",
+        f"- Cycles: {r.option_chain_cycles} / ~{r.option_chain_expected_cycles} expected",
+        f"- Rows: {r.option_chain_rows}",
+        "",
+        "## Quote reconciliation",
+        f"- Cycles: {r.quote_reconciliation_cycles} / ~{r.quote_reconciliation_expected_cycles} expected",
+        "",
+        "## WebSocket (NIFTY)",
+        f"- Rows: {r.ws_nifty_rows} / ~{r.ws_nifty_expected_rows} expected (loose heuristic, push-based feed)",
+        "",
+        "## Tick data by source/symbol",
+    ]
+    for key, count in sorted(r.tick_by_source_symbol.items()):
+        lines.append(f"- {key}: {count}")
+
+    lines += [
+        "",
+        "## Derived analytics",
+        f"- Rows: {r.derived_analytics_rows}, cycles: {r.derived_analytics_cycles}",
+        "",
+        "## Global indices",
+    ]
+    for symbol, count in sorted(r.global_indices_by_symbol.items()):
+        lines.append(f"- {symbol}: {count}")
+
+    lines += [
+        "",
+        f"## News sentiment: {r.news_rows} rows",
+        "",
+        "## Dhan API requests (api_request_log)",
+    ]
+    for key, count in sorted(r.api_requests_by_account_family.items()):
+        rl = r.api_429_by_account_family.get(key, 0)
+        lines.append(f"- {key}: {count} requests, {rl} rate-limited")
+    if r.api_latency_ms_avg is not None:
+        lines.append(f"- Latency: avg {r.api_latency_ms_avg}ms, max {r.api_latency_ms_max}ms")
+
+    lines += [
+        "",
+        f"## Validation rejects: {r.validation_rejects}",
+        f"## System errors (all alerts fired): {r.system_error_count}",
+        "",
+        "## Data gaps",
+    ]
+    if not r.data_gaps:
+        lines.append("- none")
+    for g in r.data_gaps:
+        lines.append(f"- [{g['severity']}] {g['data_type']}: {g['gap_seconds']}s")
 
     return "\n".join(lines)
 
@@ -100,10 +300,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     day = datetime.now(IST).date() if not args.date else datetime.fromisoformat(args.date).date()
-    report = generate_report(day)
-    print(report)
+    report = collect_report_data(day)
+
+    markdown = render_markdown(report)
+    print(markdown)
+    print(f"\nVERDICT: {report.verdict}")
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = LOG_DIR / f"daily_report_{day.isoformat()}.txt"
-    out_path.write_text(report)
-    print(f"\nWritten to {out_path}")
+    md_path = LOG_DIR / f"daily_report_{day.isoformat()}.md"
+    json_path = LOG_DIR / f"daily_report_{day.isoformat()}.json"
+    md_path.write_text(markdown)
+    json_path.write_text(json.dumps(report.__dict__, indent=2, default=str))
+    print(f"\nWritten to {md_path} and {json_path}")
