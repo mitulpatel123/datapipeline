@@ -138,6 +138,7 @@ def store_option_chain_snapshot(session, rows: list[dict], source_account: str) 
                 ask=validated.ask,
                 underlying_ltp=validated.underlying_ltp,
                 data_quality_flags=(quality_flags or None),
+                security_id=validated.security_id,
             )
         )
         stored += 1

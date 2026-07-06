@@ -23,6 +23,12 @@ STATEMENTS = [
     ("option_chain_snapshots.data_quality_flags", """
         ALTER TABLE option_chain_snapshots ADD COLUMN IF NOT EXISTS data_quality_flags JSONB
     """),
+    ("option_chain_snapshots.security_id", """
+        ALTER TABLE option_chain_snapshots ADD COLUMN IF NOT EXISTS security_id VARCHAR
+    """),
+    ("option_chain_snapshots security_id index", """
+        CREATE INDEX IF NOT EXISTS ix_ocs_security_id ON option_chain_snapshots (security_id)
+    """),
     ("news_sentiment.sentiment_score", """
         ALTER TABLE news_sentiment ADD COLUMN IF NOT EXISTS sentiment_score NUMERIC
     """),

@@ -40,10 +40,12 @@ class OptionChainSnapshot(Base):
     ask: Mapped[float] = mapped_column(Numeric, nullable=True)
     underlying_ltp: Mapped[float] = mapped_column(Numeric, nullable=True)
     data_quality_flags: Mapped[object] = mapped_column(JSONB, nullable=True)
+    security_id: Mapped[str] = mapped_column(String, nullable=True)
 
     __table_args__ = (
         Index("ix_ocs_fetched_at", "fetched_at"),
         Index("ix_ocs_expiry_strike", "expiry", "strike", "option_type"),
+        Index("ix_ocs_security_id", "security_id"),
     )
 
 

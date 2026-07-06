@@ -37,6 +37,7 @@ from config import settings
 from connectors.dhan_account1 import DhanAccount1, select_nearest_valid_expiry
 from connectors.dhan_account2 import DhanAccount2
 from connectors.dhan_websocket import DhanWebSocketClient
+from connectors.instrument_master import verify_known_security_ids
 from connectors.news_connector import fetch_and_store_news
 from connectors.yfinance_connector import fetch_and_store_global_indices
 from storage import redis_client
@@ -98,6 +99,7 @@ def refresh_expiry_list():
         _state["current_expiry"] = None
         return
     _state["current_expiry"] = nearest
+    redis_client.mark_write("expiry_list_refresh")
     logger.info("Nearest expiry set to %s", nearest)
 
 
@@ -167,11 +169,16 @@ def websocket_stop_job():
 @guarded("instrument_master_refresh")
 def instrument_master_refresh_job():
     if acct2:
-        acct2.download_and_cache_instrument_master()
+        acct2.download_and_cache_instrument_master()  # marks "instrument_master" itself
     else:
         from connectors.instrument_master import download_instrument_master
 
         download_instrument_master()
+        # acct2.download_and_cache_instrument_master() marks this itself; the fallback
+        # path here bypassed that entirely, which meant a real successful refresh still
+        # looked like "instrument_master never written" to the gap watchdog whenever
+        # Account 2 wasn't configured.
+        redis_client.mark_write("instrument_master")
 
 
 @guarded("eod_historical_backfill")
@@ -184,6 +191,7 @@ def eod_backfill_job():
     acct2.backfill_nifty_intraday(today, today, interval=5)
     for symbol in ("RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS"):
         acct2.backfill_stock_daily(symbol, today, today)
+    redis_client.mark_write("eod_historical_backfill")
 
 
 def build_scheduler() -> BlockingScheduler:
@@ -229,11 +237,41 @@ def build_scheduler() -> BlockingScheduler:
     return scheduler
 
 
+def verify_startup_security_ids() -> bool:
+    """Fail loudly if Dhan's instrument IDs have drifted from what the connectors
+    hardcode (NIFTY index, 5 heavyweight stocks) -- continuing with stale IDs would
+    mean silently collecting data for the wrong instruments (or none at all)."""
+    try:
+        resolved = verify_known_security_ids()
+        logger.info("Instrument ID verification passed: %s", resolved)
+        return True
+    except Exception as exc:
+        msg = f"STARTUP ABORTED: instrument ID verification failed: {exc}"
+        logger.critical(msg)
+        log_and_alert("startup_verification", msg, severity="critical")
+        return False
+
+
 def main():
     logger.info("Orchestrator starting (SOAK_MODE=%s)", settings.SOAK_MODE)
 
+    scheduler_holder: dict = {}
+
+    def _on_lock_lost():
+        # Best-effort: stop new jobs from firing. The process is about to hard-exit
+        # (exit_fn) regardless, so this is a courtesy, not the primary safety net.
+        scheduler = scheduler_holder.get("scheduler")
+        if scheduler is not None:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                logger.exception("Failed to shut down scheduler after losing orchestrator lock")
+
     owner_id = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-    lock = OrchestratorLock(redis_client.client, ORCHESTRATOR_LOCK_KEY, settings.ORCHESTRATOR_LOCK_TTL_SECONDS, owner_id)
+    lock = OrchestratorLock(
+        redis_client.client, ORCHESTRATOR_LOCK_KEY, settings.ORCHESTRATOR_LOCK_TTL_SECONDS,
+        owner_id, on_lock_lost=_on_lock_lost,
+    )
     if not lock.acquire():
         msg = (
             "Another orchestrator instance appears to already be running (Redis lock "
@@ -245,11 +283,16 @@ def main():
     lock.start_heartbeat()
 
     try:
+        if not verify_startup_security_ids():
+            logger.critical("Orchestrator startup aborted before scheduling any Dhan polling jobs")
+            return
+
         refresh_expiry_list()
         if is_market_hours_ist():
             websocket_start_job()
 
         scheduler = build_scheduler()
+        scheduler_holder["scheduler"] = scheduler
         try:
             scheduler.start()
         except (KeyboardInterrupt, SystemExit):

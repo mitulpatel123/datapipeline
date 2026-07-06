@@ -10,6 +10,7 @@ Outputs both a human-readable Markdown report and a machine-readable JSON summar
 """
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -23,6 +24,8 @@ from sqlalchemy import func, select
 from config import settings
 from config.settings import LOG_DIR
 from orchestrator import SCHEDULER_PROFILES
+from storage import redis_client
+from storage.gap_watchdog import disabled_streams
 from storage.postgres_client import get_session
 from storage.postgres_models import (
     ApiRequestLog,
@@ -34,6 +37,8 @@ from storage.postgres_models import (
     SystemError,
     TickData,
 )
+
+DUPLICATE_NEWS_PATTERN = re.compile(r"skipped (\d+) duplicate")
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_SECONDS_PER_DAY = int((15 * 3600 + 35 * 60) - (9 * 3600))  # 09:00-15:35 IST
@@ -68,8 +73,15 @@ class ReportData:
     api_latency_ms_avg: float | None = None
     api_latency_ms_max: float | None = None
     validation_rejects: int = 0
+    validation_rejects_by_component: dict = field(default_factory=dict)
     data_gaps: list = field(default_factory=list)
+    longest_gap_seconds_by_stream: dict = field(default_factory=dict)
     system_error_count: int = 0
+    duplicate_news_skipped: int = 0
+    expiry_list_refresh_status: str = "unknown"
+    instrument_master_status: str = "unknown"
+    eod_backfill_status: str = "unknown"
+    disabled_optional_streams: dict = field(default_factory=dict)
     verdict: str = "PASS"
     verdict_reasons: list = field(default_factory=list)
 
@@ -78,6 +90,17 @@ def _pct_missing(actual: int, expected: int) -> float:
     if expected <= 0:
         return 0.0
     return max(0.0, (expected - actual) / expected)
+
+
+def _stream_status(data_type: str) -> str:
+    """Current status (not day-scoped -- these keys hold only the latest write time,
+    there's no per-day history to derive an exact count from without a dedicated
+    counter). Good enough to answer "did this actually run, and how recently"."""
+    raw = redis_client.client.get(f"nifty:last_successful_write:{data_type}")
+    if raw is None:
+        return "never written this run"
+    last_write = datetime.fromtimestamp(float(raw), tz=IST)
+    return f"last refreshed {last_write.isoformat()}"
 
 
 def collect_report_data(day) -> ReportData:
@@ -174,6 +197,27 @@ def collect_report_data(day) -> ReportData:
             )
         ).scalar() or 0
 
+        reject_rows = session.execute(
+            select(SystemError.component, func.count()).where(
+                SystemError.fetched_at >= start, SystemError.fetched_at < end,
+                SystemError.error_message.ilike("%rejected on validation%"),
+            ).group_by(SystemError.component)
+        ).all()
+        for component, count in reject_rows:
+            r.validation_rejects_by_component[component] = count
+
+        news_dup_rows = session.execute(
+            select(SystemError.error_message).where(
+                SystemError.fetched_at >= start, SystemError.fetched_at < end,
+                SystemError.component == "news_connector",
+                SystemError.error_message.ilike("%skipped%duplicate%"),
+            )
+        ).scalars().all()
+        for message in news_dup_rows:
+            match = DUPLICATE_NEWS_PATTERN.search(message)
+            if match:
+                r.duplicate_news_skipped += int(match.group(1))
+
         r.system_error_count = session.execute(
             select(func.count()).select_from(SystemError).where(
                 SystemError.fetched_at >= start, SystemError.fetched_at < end
@@ -187,6 +231,16 @@ def collect_report_data(day) -> ReportData:
             {"data_type": g.data_type, "gap_seconds": float(g.gap_seconds) if g.gap_seconds else None, "severity": g.severity}
             for g in gaps
         ]
+        for gap in r.data_gaps:
+            if gap["gap_seconds"] is None:
+                continue
+            current = r.longest_gap_seconds_by_stream.get(gap["data_type"], 0.0)
+            r.longest_gap_seconds_by_stream[gap["data_type"]] = max(current, gap["gap_seconds"])
+
+    r.expiry_list_refresh_status = _stream_status("expiry_list_refresh")
+    r.instrument_master_status = _stream_status("instrument_master")
+    r.eod_backfill_status = _stream_status("eod_historical_backfill")
+    r.disabled_optional_streams = disabled_streams()
 
     _apply_verdict(r)
     return r
@@ -282,6 +336,28 @@ def render_markdown(r: ReportData) -> str:
     lines += [
         "",
         f"## Validation rejects: {r.validation_rejects}",
+    ]
+    for component, count in sorted(r.validation_rejects_by_component.items()):
+        lines.append(f"- {component}: {count}")
+
+    lines += [
+        "",
+        f"## Duplicate/skipped news articles: {r.duplicate_news_skipped}",
+        "",
+        "## Refresh/backfill status",
+        f"- Expiry list refresh: {r.expiry_list_refresh_status}",
+        f"- Instrument master: {r.instrument_master_status}",
+        f"- EOD historical backfill: {r.eod_backfill_status}",
+        "",
+        "## Disabled optional streams",
+    ]
+    if not r.disabled_optional_streams:
+        lines.append("- none")
+    for name, reason in sorted(r.disabled_optional_streams.items()):
+        lines.append(f"- {name}: {reason}")
+
+    lines += [
+        "",
         f"## System errors (all alerts fired): {r.system_error_count}",
         "",
         "## Data gaps",
@@ -290,6 +366,12 @@ def render_markdown(r: ReportData) -> str:
         lines.append("- none")
     for g in r.data_gaps:
         lines.append(f"- [{g['severity']}] {g['data_type']}: {g['gap_seconds']}s")
+
+    lines += ["", "## Longest gap per stream"]
+    if not r.longest_gap_seconds_by_stream:
+        lines.append("- none")
+    for data_type, seconds in sorted(r.longest_gap_seconds_by_stream.items(), key=lambda kv: -kv[1]):
+        lines.append(f"- {data_type}: {seconds:.0f}s")
 
     return "\n".join(lines)
 

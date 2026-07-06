@@ -104,3 +104,75 @@ def test_generic_failure_retries_then_raises(manager, monkeypatch):
         manager.call("optionchain", "option_chain", counting_fn)
 
     assert call_count["n"] > 1, "non-rate-limit failures should retry with backoff"
+
+
+@pytest.fixture
+def manager_with_logged_attempts(monkeypatch):
+    """Like `manager`, but records _log_request calls instead of silencing them, so
+    tests can assert what was logged per attempt (success/failure)."""
+    monkeypatch.setattr("connectors.dhan_request_manager.log_and_alert", lambda *a, **k: None)
+    logged = []
+
+    def _record(self, endpoint_family, endpoint_name, success, remarks, latency_ms, attempt, rate_limited, circuit_state):
+        logged.append({"attempt": attempt, "success": success, "remarks": remarks})
+
+    monkeypatch.setattr("connectors.dhan_request_manager.DhanRequestManager._log_request", _record)
+    monkeypatch.setattr("connectors.dhan_request_manager.time.sleep", lambda seconds: None)
+    m = DhanRequestManager("test_account")
+    for fam in m.families.values():
+        fam.min_interval_limiter = None
+    return m, logged
+
+
+def test_exception_on_first_call_then_success_retries_and_logs_both(manager_with_logged_attempts):
+    manager, logged = manager_with_logged_attempts
+    call_count = {"n": 0}
+
+    def flaky_fn(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise ConnectionError("connection reset by peer")
+        return _success_fn()
+
+    result = manager.call("optionchain", "option_chain", flaky_fn)
+
+    assert call_count["n"] == 2
+    assert result["status"] == "success"
+    assert len(logged) == 2
+    assert logged[0]["success"] is False
+    assert "ConnectionError" in logged[0]["remarks"]
+    assert logged[1]["success"] is True
+
+
+def test_permanent_exception_stops_after_max_retries_no_infinite_loop(manager_with_logged_attempts):
+    manager, logged = manager_with_logged_attempts
+    call_count = {"n": 0}
+
+    def always_raises(*args, **kwargs):
+        call_count["n"] += 1
+        raise TimeoutError("upstream timed out")
+
+    with pytest.raises(RuntimeError, match="Dhan API call failed"):
+        manager.call("optionchain", "option_chain", always_raises)
+
+    # MAX_RETRIES=3 -> 4 total attempts, not an infinite loop.
+    from connectors.dhan_request_manager import MAX_RETRIES
+
+    assert call_count["n"] == MAX_RETRIES + 1
+    assert all(not entry["success"] for entry in logged)
+    assert all("TimeoutError" in entry["remarks"] for entry in logged)
+
+
+def test_exception_containing_rate_limit_text_still_trips_breaker(manager_with_logged_attempts):
+    manager, logged = manager_with_logged_attempts
+    call_count = {"n": 0}
+
+    def rate_limited_exception_fn(*args, **kwargs):
+        call_count["n"] += 1
+        raise RuntimeError("HTTP 429: Too many requests")
+
+    with pytest.raises(RuntimeError, match="rate-limited"):
+        manager.call("optionchain", "option_chain", rate_limited_exception_fn)
+
+    assert call_count["n"] == 1, "an exception whose text signals a 429 must not retry into it"
+    assert manager.families["optionchain"].circuit_state == CircuitState.COOLDOWN

@@ -122,7 +122,7 @@ class DhanAccount1:
                         "bid": leg.get("top_bid_price"),
                         "ask": leg.get("top_ask_price"),
                         "underlying_ltp": underlying_ltp,
-                        "security_id": leg.get("security_id"),
+                        "security_id": (str(leg["security_id"]) if leg.get("security_id") is not None else None),
                     }
                 )
 

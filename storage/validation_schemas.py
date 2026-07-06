@@ -21,6 +21,7 @@ class OptionChainRowIn(BaseModel):
     bid: float | None = Field(default=None, ge=0)
     ask: float | None = Field(default=None, ge=0)
     underlying_ltp: float | None = Field(default=None, ge=0)
+    security_id: str | None = None
 
     def dedupe_key(self) -> str:
         return f"optionchain:{self.expiry}:{self.strike}:{self.option_type}:{self.fetched_at.isoformat()}"

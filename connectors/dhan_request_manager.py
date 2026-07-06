@@ -179,7 +179,24 @@ class DhanRequestManager:
             self.token_bucket.acquire()
 
             start = time.monotonic()
-            last_response = fn(*args, **kwargs)
+            try:
+                last_response = fn(*args, **kwargs)
+            except Exception as exc:
+                # The dhanhq SDK normally catches network/timeout errors itself and
+                # returns a {"status": "failure", ...} dict -- but don't rely on that
+                # holding for every code path forever. An uncaught exception here would
+                # otherwise skip logging, retry, and circuit-breaker handling entirely.
+                # Convert it into the same synthetic failure shape and fall through to
+                # the existing unified failure/retry logic below.
+                last_response = {
+                    "status": "failure",
+                    "remarks": f"{type(exc).__name__}: {exc}",
+                    "data": "",
+                }
+                logger.warning(
+                    "%s/%s (%s) raised %s on attempt %d: %s",
+                    self.account_label, endpoint_family, endpoint_name, type(exc).__name__, attempt, exc,
+                )
             last_latency_ms = int((time.monotonic() - start) * 1000)
 
             success = last_response.get("status") == "success"

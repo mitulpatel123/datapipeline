@@ -9,6 +9,16 @@ healthy quote-reconciliation feed even though both write to the same tick_data
 table. VIX/GIFT/FII-DII are intentionally absent from WATCHED_KEYS -- they're
 blocked stubs (see connectors/scraper_*.py) and were never scheduled, so there's
 nothing to falsely flag as a gap (spec item 37).
+
+Optional integrations (currently just Marketaux news) are tracked in
+OPTIONAL_STREAMS: a stream only enters the watch list if its enabled-check passes,
+so a deliberately-unconfigured optional API never produces a false "never started"
+alert. The daily report uses the same registry to list disabled streams explicitly
+rather than silently omitting them.
+
+Dynamic option-chain strikes are intentionally NOT watched here -- the ATM window
+shifts through the day (see connectors/dhan_websocket.py refresh_option_universe),
+so a fixed per-strike gap key would misfire constantly as strikes roll in and out.
 """
 import logging
 import time
@@ -25,16 +35,55 @@ logger = logging.getLogger(__name__)
 STALE_MULTIPLIER = 3
 _process_start_monotonic = time.monotonic()
 
+HEAVYWEIGHT_SYMBOLS = ("RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS")
+
+# name -> callable returning whether this optional stream is currently enabled.
+OPTIONAL_STREAMS = {
+    "news_sentiment": lambda: bool(settings.MARKETAUX_API_KEY),
+}
+
 # (redis_key, expected_interval_seconds, startup_grace_seconds)
-WATCHED_KEYS = [
+_ALWAYS_WATCHED_KEYS = [
     ("option_chain_snapshots:acct1", 3, 15),
     ("tick_data:acct1_ws:NIFTY", 5, 30),
+    ("tick_data:acct1_ws:NIFTY_FUT", 5, 30),
     ("tick_data:acct1_quote:NIFTY", 5, 30),
+    ("tick_data:acct1_quote:NIFTY_FUT", 5, 30),
     ("derived_analytics", 3, 15),
     ("global_indices", 300, 600),
-    ("news_sentiment", 300, 600),
     ("instrument_master", 86400, 600),
 ]
+for _symbol in HEAVYWEIGHT_SYMBOLS:
+    _ALWAYS_WATCHED_KEYS.append((f"tick_data:acct1_ws:{_symbol}", 5, 30))
+
+# Optional-stream watch definitions, keyed by the same name used in OPTIONAL_STREAMS.
+_OPTIONAL_WATCHED_KEYS = {
+    "news_sentiment": ("news_sentiment", 300, 600),
+}
+
+
+def get_watched_keys() -> list[tuple[str, int, int]]:
+    """Built fresh on every call (not a frozen module constant) so tests can
+    monkeypatch settings.MARKETAUX_API_KEY (or any future optional-stream flag) and
+    see the watch list react without reimporting this module."""
+    keys = list(_ALWAYS_WATCHED_KEYS)
+    for name, is_enabled in OPTIONAL_STREAMS.items():
+        if is_enabled():
+            keys.append(_OPTIONAL_WATCHED_KEYS[name])
+    return keys
+
+
+# Backward-compatible module attribute -- tests/callers that iterate WATCHED_KEYS
+# directly still see the always-on set; use get_watched_keys() for the live list.
+WATCHED_KEYS = _ALWAYS_WATCHED_KEYS
+
+
+def disabled_streams() -> dict[str, str]:
+    """name -> human reason, for streams whose enabled-check currently fails."""
+    reasons = {
+        "news_sentiment": "MARKETAUX_API_KEY not configured",
+    }
+    return {name: reasons[name] for name, is_enabled in OPTIONAL_STREAMS.items() if not is_enabled()}
 
 
 def _cooldown_key(data_type: str) -> str:
@@ -64,7 +113,7 @@ def check_gaps() -> list[str]:
     fired = []
 
     with get_session() as session:
-        for data_type, expected_interval, grace_seconds in WATCHED_KEYS:
+        for data_type, expected_interval, grace_seconds in get_watched_keys():
             raw = redis_client.client.get(f"nifty:last_successful_write:{data_type}")
             meta = _parse_data_type(data_type)
 
